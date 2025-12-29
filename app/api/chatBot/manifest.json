@@ -1,21 +1,30 @@
-
 {
-  "name": "Assistente de Flyers",
-  "description": "Bot que gera flyers para clientes",
-  "avatarUrl": "https://seusite.com/avatar.png",
+  "name": "IA Flyers Bot",
+  "description": "Bot para gerar flyers e auxiliar tarefas do dia a dia",
+  "version": "1.0.0",
+  "displayName": "IA Flyers",
+  "avatarUrl": "https://URL_DO_AVATAR.png",
   "bot": {
-    "commandLists": [
-      {
-        "commands": [
-          {
-            "name": "gerar_flyer",
-            "description": "Gera um flyer para o cliente"
-          }
-        ]
-      }
-    ],
-    "endpointUrl": "https://ia-flyers-confi-test.vercel.app/api/chatBot",
-    "events": ["ADDED_TO_SPACE", "MESSAGE"]
+    "name": "IA Flyers Bot",
+    "displayName": "IA Flyers",
+    "avatarUrl": "https://URL_DO_AVATAR.png",
+    "endpoint": "https://ia-flyers-test2.vercel.app/api/chatBot",
+    "supportsDialogs": false,
+    "threaded": true,
+    "commandLists": []
   },
-  "oauthScopes": ["https://www.googleapis.com/auth/chat.bot"]
+  "eventSubscriptions": {
+    "message": true
+  },
+  "permissions": [
+    "READ_MESSAGES"
+  ],
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/chat.bot"
+  ],
+  "settings": {
+    "conversation": {
+      "replyInThread": true
+    }
+  }
 }
