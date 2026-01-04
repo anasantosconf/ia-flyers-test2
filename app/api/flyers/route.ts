@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 
 export async function GET() {
   try {
+    const supabaseAdmin = getSupabaseAdmin();
+    if (!supabaseAdmin) {
+      return NextResponse.json([], { status: 200 }); // ✅ não quebra o site local
+    }
+
     const { data, error } = await supabaseAdmin
       .from("flyers")
       .select("*")
@@ -19,8 +24,15 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
+    const supabaseAdmin = getSupabaseAdmin();
+    if (!supabaseAdmin) {
+      return NextResponse.json(
+        { error: "Supabase não configurado (env vars ausentes)" },
+        { status: 500 }
+      );
+    }
 
+    const body = await req.json();
     const prompt = body.prompt;
     const from = body.from || "site";
     const brand = body.brand || "Confi Seguros";
