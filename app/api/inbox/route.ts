@@ -4,7 +4,9 @@ import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 export async function GET() {
   try {
     const supabaseAdmin = getSupabaseAdmin();
-    if (!supabaseAdmin) return NextResponse.json([], { status: 200 });
+    if (!supabaseAdmin) {
+      return NextResponse.json([], { status: 200 });
+    }
 
     const { data, error } = await supabaseAdmin
       .from("inbox_messages")
