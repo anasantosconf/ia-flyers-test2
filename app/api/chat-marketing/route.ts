@@ -1,77 +1,53 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
-});
-
 export async function POST(req: NextRequest) {
   try {
-    const { message } = await req.json();
+    const apiKey = process.env.OPENAI_API_KEY;
 
-    if (!message) {
+    if (!apiKey) {
       return NextResponse.json(
-        { error: "Mensagem não fornecida" },
-        { status: 400 }
+        { error: "OPENAI_API_KEY não configurada" },
+        { status: 500 }
       );
     }
 
+    const openai = new OpenAI({ apiKey });
+
+    const { message } = await req.json();
+
+    if (!message) {
+      return NextResponse.json({ error: "Mensagem vazia" }, { status: 400 });
+    }
+
     const systemPrompt = `
-Você é o estrategista de marketing da Confisegu.
-
-Seu papel é:
-- Pensar estratégias de marketing e vendas
-- Criar ideias de campanhas
-- Sugerir conteúdos para Instagram, WhatsApp e funil
-- Traduzir objetivos comerciais em ações práticas
-- Atuar como um head de marketing experiente
-
-REGRAS:
-- Responda SEMPRE em JSON puro
-- Nunca use markdown
-- Nunca explique o processo
-- Seja prático, estratégico e aplicável
-
-Estrutura obrigatória:
+Você é um assistente de marketing da marca Confi.
+Você cria e organiza pedidos de flyers e conteúdos.
+Sempre responda em JSON puro:
 {
-  "tipo": "IDEIA_MARKETING | PLANO_MARKETING | CONTEUDO_MARKETING | ANALISE_MARKETING",
-  "resposta": "resumo executivo direto",
-  "ideias": ["ideia 1", "ideia 2", "ideia 3"],
-  "observacoes": "insights estratégicos adicionais"
+  "tipo": "GERAR_POST_INSTAGRAM | ATIVIDADE_GERAL | CONVERSA",
+  "resposta": "texto para o usuário",
+  "prompt": "prompt final pronto para gerar a arte"
 }
-`;
+Regras:
+- Nunca ter erros de português ou acentuação.
+- Sempre respeitar identidade visual Confi (cores, tipografia, estilo clean).
+`.trim();
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0.7,
+      temperature: 0.4,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: message },
       ],
     });
 
-    const content = completion.choices[0].message.content;
+    const resposta = completion.choices[0].message.content;
 
-    if (!content) {
-      throw new Error("Resposta vazia da OpenAI");
-    }
-
-    // Garante que sempre retorna JSON válido
-    const parsed = JSON.parse(content);
-
-    return NextResponse.json(parsed);
-
+    return NextResponse.json({ ai: resposta });
   } catch (error) {
-    console.error("Erro chat-marketing:", error);
-
-    return NextResponse.json(
-      {
-        tipo: "ERRO",
-        resposta: "Erro ao gerar resposta de marketing.",
-        ideias: [],
-        observacoes: ""
-      },
-      { status: 500 }
-    );
+    console.error("Erro no chat-marketing:", error);
+    return NextResponse.json({ error: "Erro interno no servidor" }, { status: 500 });
   }
 }

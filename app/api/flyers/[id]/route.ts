@@ -1,10 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 
 type Params = Promise<{ id: string }>;
 
 export async function GET(req: NextRequest, context: { params: Params }) {
   try {
+    const supabaseAdmin = getSupabaseAdmin();
+    if (!supabaseAdmin) {
+      return NextResponse.json(
+        { error: "Supabase não configurado (env vars ausentes)" },
+        { status: 500 }
+      );
+    }
+
     const { id } = await context.params;
 
     const { data, error } = await supabaseAdmin
@@ -24,6 +32,14 @@ export async function GET(req: NextRequest, context: { params: Params }) {
 
 export async function PATCH(req: NextRequest, context: { params: Params }) {
   try {
+    const supabaseAdmin = getSupabaseAdmin();
+    if (!supabaseAdmin) {
+      return NextResponse.json(
+        { error: "Supabase não configurado (env vars ausentes)" },
+        { status: 500 }
+      );
+    }
+
     const { id } = await context.params;
     const body = await req.json();
 
