@@ -14,50 +14,95 @@ type Flyer = {
   id: string;
   prompt: string;
   from_source: string;
+  brand: string;
+  format: string;
   status: string;
-  created_at: string;
   preview_base64?: string | null;
-  brand?: string | null;
-  format?: string | null;
+  created_at: string;
+};
+
+type InboxMessage = {
+  id: string;
+  from_name: string | null;
+  from_phone: string | null;
+  text: string;
+  channel: string;
+  classification: string | null;
+  processed: boolean;
+  created_at: string;
 };
 
 export default function Home() {
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [flyers, setFlyers] = useState<Flyer[]>([]);
   const [message, setMessage] = useState("");
 
-  // Loading para botão aprovar (por flyer)
-  const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [flyers, setFlyers] = useState<Flyer[]>([]);
+  const [inbox, setInbox] = useState<InboxMessage[]>([]);
 
-  // Carregar dados iniciais
-  useEffect(() => {
-    refreshData();
-  }, []);
-
-  async function refreshData() {
+  async function loadAll() {
     try {
-      const [tasksRes, flyersRes] = await Promise.all([
+      const [tasksRes, flyersRes, inboxRes] = await Promise.all([
         fetch("/api/tasks"),
         fetch("/api/flyers"),
+        fetch("/api/inbox"),
       ]);
 
       const tasksData = await tasksRes.json();
       const flyersData = await flyersRes.json();
+      const inboxData = await inboxRes.json();
 
-      setTasks(Array.isArray(tasksData) ? tasksData : []);
-      setFlyers(Array.isArray(flyersData) ? flyersData : []);
+      setTasks(tasksData || []);
+      setFlyers(flyersData || []);
+      setInbox(inboxData || []);
     } catch (err) {
       console.error(err);
-      alert("Erro ao carregar dados.");
     }
   }
 
-  // Enviar mensagem (fluxo: chat -> orchestrator -> cria task ou flyer)
-  async function sendMessage() {
-    try {
-      if (!message.trim()) return;
+  useEffect(() => {
+    loadAll();
 
-      // 1) Chama /api/chat para classificar e retornar JSON
+    // 🔁 Atualiza inbox automaticamente a cada 5s
+    const interval = setInterval(() => {
+      fetch("/api/inbox")
+        .then((r) => r.json())
+        .then((data) => setInbox(data || []))
+        .catch(console.error);
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  async function approveFlyer(id: string) {
+    try {
+      const res = await fetch(`/api/flyers/${id}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+
+      const data = await res.json();
+
+      if (!data.success) {
+        alert(data.error || "Erro ao aprovar");
+        return;
+      }
+
+      // atualiza lista
+      setFlyers((prev) =>
+        prev.map((f) => (f.id === id ? { ...f, status: "APROVADO" } : f))
+      );
+    } catch (err) {
+      console.error(err);
+      alert("Erro ao aprovar flyer");
+    }
+  }
+
+  async function sendMessage() {
+    if (!message) return;
+
+    try {
+      // 1) Chat classifica intenção
       const chatRes = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -65,246 +110,167 @@ export default function Home() {
       });
 
       const chatData = await chatRes.json();
+      const aiRaw = chatData.ai;
 
-      // chatData deve ser JSON com tipo/resposta/prompt
-      // Se sua rota /api/chat estiver retornando { ai: "..." }, ajuste aqui:
-      const aiPayload =
-        typeof chatData?.ai === "string" ? safeParseJson(chatData.ai) : chatData;
-
-      if (!aiPayload?.tipo) {
-        alert("Não consegui interpretar a resposta da IA.");
-        console.log("Resposta IA:", chatData);
+      let aiJson: any = null;
+      try {
+        aiJson = JSON.parse(aiRaw);
+      } catch (err) {
+        console.error("AI não retornou JSON:", aiRaw);
+        alert("A IA não retornou JSON válido. Veja console.");
         return;
       }
 
-      // 2) Chama o orchestrator com esse JSON
+      // 2) Orchestrator decide ação
       const orchRes = await fetch("/api/orchestrator", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(aiPayload),
+        body: JSON.stringify(aiJson),
       });
 
       const orchData = await orchRes.json();
 
-      // 3) Executa ações com base no orchestrator
+      // 3) Executa ação
+      if (orchData.action === "GERAR_FLYER") {
+        // gera imagem
+        const genRes = await fetch("/api/generateFlyerImage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(orchData.data),
+        });
+
+        const genData = await genRes.json();
+
+        if (!genData.success) {
+          alert(genData.error || "Erro ao gerar flyer");
+          return;
+        }
+
+        // salva no Supabase (flyers table)
+        const flyerRes = await fetch("/api/flyers", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: orchData.data.prompt,
+            from: "site",
+            brand: orchData.data.brand,
+            format: orchData.data.format,
+            previewBase64: genData.previewBase64,
+          }),
+        });
+
+        const flyerData = await flyerRes.json();
+        if (flyerData.success) {
+          setFlyers((prev) => [flyerData.flyer, ...prev]);
+        }
+      }
+
       if (orchData.action === "CRIAR_TAREFA") {
         const taskRes = await fetch("/api/tasks", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            texto: orchData.data?.descricao || aiPayload.prompt || message,
+            texto: orchData.data.descricao,
             origem: "site",
           }),
         });
 
-        const taskJson = await taskRes.json();
-        if (taskJson?.task) setTasks((prev) => [taskJson.task, ...prev]);
-      }
-
-      if (orchData.action === "GERAR_FLYER") {
-        // 3.1 cria flyer no banco
-        const flyerRes = await fetch("/api/flyers", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            prompt: orchData.data?.prompt || aiPayload.prompt || message,
-            from: "site",
-            brand: orchData.data?.brand || "Confi Seguros",
-            format: orchData.data?.format || "instagram_feed",
-          }),
-        });
-
-        const flyerJson = await flyerRes.json();
-        const createdFlyer: Flyer | null = flyerJson?.flyer || null;
-
-        if (createdFlyer) {
-          // 3.2 gera imagem com identidade visual
-          const genRes = await fetch("/api/generateFlyerImage", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              prompt: createdFlyer.prompt,
-              brand: createdFlyer.brand || "Confi Seguros",
-              format: createdFlyer.format || "instagram_feed",
-            }),
-          });
-
-          const genJson = await genRes.json();
-
-          // atualiza lista local: adiciona flyer com preview
-          setFlyers((prev) => [
-            {
-              ...createdFlyer,
-              preview_base64: genJson?.previewBase64 || null,
-              status: "GERADO",
-            },
-            ...prev,
-          ]);
+        const taskData = await taskRes.json();
+        if (taskData.success) {
+          setTasks((prev) => [taskData.task, ...prev]);
         }
       }
 
       setMessage("");
     } catch (err) {
       console.error(err);
-      alert("Erro inesperado ao processar a mensagem. Veja o console.");
-    }
-  }
-
-  // Aprovar flyer
-  async function approveFlyer(flyerId: string) {
-    try {
-      setApprovingId(flyerId);
-
-      const res = await fetch(`/api/flyers/${flyerId}/approve`, {
-        method: "POST",
-      });
-
-      const data = await res.json();
-
-      if (!data?.success) {
-        alert(data?.error || "Erro ao aprovar flyer");
-        return;
-      }
-
-      // Atualiza status na UI
-      setFlyers((prev) =>
-        prev.map((f) => (f.id === flyerId ? { ...f, status: "APROVADO" } : f))
-      );
-    } catch (err) {
-      console.error(err);
-      alert("Erro inesperado ao aprovar flyer");
-    } finally {
-      setApprovingId(null);
+      alert("Erro inesperado ao processar. Veja console.");
     }
   }
 
   return (
-    <main style={{ maxWidth: 1000, margin: "0 auto", padding: "2rem" }}>
-      <h1 style={{ fontSize: 26, marginBottom: 10 }}>🧠 Assistente Confi</h1>
+    <div style={{ padding: "1.5rem", fontFamily: "Arial, sans-serif" }}>
+      <h1 style={{ marginBottom: "1rem" }}>🧠 Assistente Confi — Painel</h1>
 
       {/* Input */}
-      <div style={{ display: "flex", gap: 10, marginBottom: 18 }}>
+      <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1.5rem" }}>
         <input
           type="text"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
           placeholder="Digite seu pedido..."
-          style={{
-            width: "100%",
-            padding: "0.9rem",
-            borderRadius: 12,
-            border: "1px solid #ddd",
-          }}
+          style={{ flex: 1, padding: "0.75rem", borderRadius: 8, border: "1px solid #ddd" }}
         />
         <button
           onClick={sendMessage}
           style={{
-            padding: "0.9rem 1.1rem",
-            borderRadius: 12,
-            border: "1px solid #111",
-            background: "#111",
-            color: "white",
+            padding: "0.75rem 1.25rem",
+            borderRadius: 8,
+            border: "none",
+            background: "#000",
+            color: "#fff",
             cursor: "pointer",
           }}
         >
           Enviar
         </button>
-
-        <button
-          onClick={refreshData}
-          style={{
-            padding: "0.9rem 1.1rem",
-            borderRadius: 12,
-            border: "1px solid #ddd",
-            background: "white",
-            cursor: "pointer",
-          }}
-        >
-          Atualizar
-        </button>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
-        {/* Tarefas */}
-        <section
-          style={{
-            border: "1px solid #eee",
-            borderRadius: 16,
-            padding: 16,
-            minHeight: 300,
-          }}
-        >
-          <h2 style={{ fontSize: 18, marginBottom: 12 }}>📋 Tarefas / Anotações</h2>
-
-          {tasks.length === 0 && <p>Nenhuma tarefa registrada.</p>}
-
-          <ul style={{ paddingLeft: 18 }}>
-            {tasks.map((t) => (
-              <li key={t.id} style={{ marginBottom: 10 }}>
-                <b>[{t.status}]</b> {t.texto}{" "}
-                <span style={{ opacity: 0.6 }}>({t.origem})</span>
+      {/* Layout 3 colunas */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "1rem" }}>
+        {/* Inbox */}
+        <div style={{ border: "1px solid #eee", borderRadius: 12, padding: "1rem" }}>
+          <h2 style={{ marginTop: 0 }}>📥 Inbox (externo)</h2>
+          {inbox.length === 0 && <p>Nenhuma mensagem ainda.</p>}
+          <ul style={{ paddingLeft: "1rem" }}>
+            {inbox.map((m) => (
+              <li key={m.id} style={{ marginBottom: "0.75rem" }}>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  {m.channel} • {new Date(m.created_at).toLocaleString()}
+                </div>
+                <div style={{ fontWeight: 700 }}>
+                  {m.from_name || m.from_phone || "Contato"}:
+                </div>
+                <div>{m.text}</div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  processed: {String(m.processed)} • classification:{" "}
+                  {m.classification || "—"}
+                </div>
               </li>
             ))}
           </ul>
-        </section>
+        </div>
+
+        {/* Tasks */}
+        <div style={{ border: "1px solid #eee", borderRadius: 12, padding: "1rem" }}>
+          <h2 style={{ marginTop: 0 }}>📋 Tarefas / Anotações</h2>
+          {tasks.length === 0 && <p>Nenhuma tarefa registrada.</p>}
+          <ul style={{ paddingLeft: "1rem" }}>
+            {tasks.map((t) => (
+              <li key={t.id} style={{ marginBottom: "0.75rem" }}>
+                <strong>[{t.status}]</strong> {t.texto}
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  {t.origem} • {new Date(t.created_at).toLocaleString()}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
 
         {/* Flyers */}
-        <section
-          style={{
-            border: "1px solid #eee",
-            borderRadius: 16,
-            padding: 16,
-            minHeight: 300,
-          }}
-        >
-          <h2 style={{ fontSize: 18, marginBottom: 12 }}>🟣 Flyers</h2>
-
-          {flyers.length === 0 && <p>Nenhum flyer registrado.</p>}
-
-          <ul style={{ listStyle: "none", paddingLeft: 0 }}>
+        <div style={{ border: "1px solid #eee", borderRadius: 12, padding: "1rem" }}>
+          <h2 style={{ marginTop: 0 }}>🟣 Flyers</h2>
+          {flyers.length === 0 && <p>Nenhum flyer ainda.</p>}
+          <ul style={{ paddingLeft: "1rem" }}>
             {flyers.map((f) => (
-              <li
-                key={f.id}
-                style={{
-                  border: "1px solid #f1f1f1",
-                  borderRadius: 14,
-                  padding: 14,
-                  marginBottom: 12,
-                }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                  <div>
-                    <b>[{f.status}]</b> <span style={{ opacity: 0.8 }}>{f.prompt}</span>
-                    <div style={{ fontSize: 12, opacity: 0.6, marginTop: 4 }}>
-                      origem: {f.from_source} • {f.brand || "Confi Seguros"} •{" "}
-                      {f.format || "instagram_feed"}
-                    </div>
-                  </div>
-
-                  {/* Botão Aprovar */}
-                  {f.status !== "APROVADO" ? (
-                    <button
-                      onClick={() => approveFlyer(f.id)}
-                      disabled={approvingId === f.id}
-                      style={{
-                        height: 40,
-                        padding: "0 14px",
-                        borderRadius: 12,
-                        border: "1px solid #111",
-                        background: approvingId === f.id ? "#999" : "#111",
-                        color: "white",
-                        cursor: approvingId === f.id ? "not-allowed" : "pointer",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {approvingId === f.id ? "Aprovando..." : "Aprovar ✅"}
-                    </button>
-                  ) : (
-                    <span style={{ fontSize: 13, color: "#0a7b28", fontWeight: 700 }}>
-                      ✅ Aprovado
-                    </span>
-                  )}
+              <li key={f.id} style={{ marginBottom: "1rem" }}>
+                <div style={{ fontWeight: 700 }}>
+                  [{f.status}] {f.brand} • {f.format}
                 </div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  {f.from_source} • {new Date(f.created_at).toLocaleString()}
+                </div>
+                <div style={{ marginTop: 6 }}>{f.prompt}</div>
 
                 {/* Preview */}
                 {f.preview_base64 && (
@@ -313,27 +279,52 @@ export default function Home() {
                     alt="Preview Flyer"
                     style={{
                       width: "100%",
-                      maxWidth: 420,
-                      marginTop: 12,
+                      maxWidth: 300,
+                      marginTop: "0.75rem",
                       borderRadius: 12,
                       border: "1px solid #eee",
                     }}
                   />
                 )}
+
+                {/* Aprovar */}
+                {f.status === "AGUARDANDO_APROVACAO" && (
+                  <button
+                    onClick={() => approveFlyer(f.id)}
+                    style={{
+                      marginTop: "0.75rem",
+                      padding: "0.6rem 1rem",
+                      borderRadius: 8,
+                      border: "none",
+                      background: "#ffce0a",
+                      color: "#000",
+                      cursor: "pointer",
+                      fontWeight: 700,
+                    }}
+                  >
+                    ✅ Aprovar
+                  </button>
+                )}
               </li>
             ))}
           </ul>
-        </section>
+        </div>
       </div>
-    </main>
-  );
-}
 
-/** Tenta converter string JSON em objeto */
-function safeParseJson(str: string) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
+      <div style={{ marginTop: "1.25rem" }}>
+        <button
+          onClick={loadAll}
+          style={{
+            padding: "0.6rem 1rem",
+            borderRadius: 8,
+            border: "1px solid #ddd",
+            background: "#fff",
+            cursor: "pointer",
+          }}
+        >
+          🔄 Atualizar tudo
+        </button>
+      </div>
+    </div>
+  );
 }
