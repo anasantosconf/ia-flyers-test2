@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 import { uploadPngToSupabaseStorage } from "@/lib/storage";
+import { pickLogo, BrandFolder } from "@/lib/logos";
+import { overlayLogoOnBuffer } from "@/lib/overlayLogoBuffer";
+import { detectCornerBg } from "@/lib/detectBg";
 
 export const runtime = "nodejs";
 const isDev = process.env.NODE_ENV !== "production";
@@ -35,20 +38,26 @@ function getFlyerIdFromUrl(req: NextRequest): string | null {
 }
 
 function base64ToBuffer(base64: string): Buffer {
-  // se vier com prefixo data:image/png;base64,...
-  const cleaned = base64.includes("base64,")
-    ? base64.split("base64,")[1]
-    : base64;
-
+  const cleaned = base64.includes("base64,") ? base64.split("base64,")[1] : base64;
   return Buffer.from(cleaned, "base64");
+}
+
+function brandToFolder(brand: string | null): BrandFolder {
+  const b = (brand || "").toLowerCase();
+  if (b.includes("benef")) return "beneficios";
+  if (b.includes("finan")) return "financas";
+  if (b.includes("seguro")) return "seguros";
+  return "geral";
 }
 
 /**
  * POST /api/flyers/:id/upload-image
  *
- * Agora funciona assim:
  * - Busca flyer no Supabase
  * - Usa preview_base64 (gerado no /generate-image)
+ * - Detecta fundo no canto (top-left)
+ * - Escolhe logo correta (branca/preta/colorida)
+ * - Cola logo (Sharp) dentro do safe area
  * - Sobe pro Supabase Storage
  * - Salva image_url e status=IMAGE_READY
  */
@@ -63,10 +72,10 @@ export async function POST(req: NextRequest) {
     const bucket = process.env.SUPABASE_STORAGE_BUCKET || "flyers";
     const prefix = process.env.SUPABASE_STORAGE_PREFIX || "generated";
 
-    // 1) busca flyer
+    // 1) busca flyer no Supabase (inclui brand/format pra escolher logo)
     const { data: flyer, error: fetchErr } = await supabaseAdmin
       .from("flyers")
-      .select("id, preview_base64, image_url, status")
+      .select("id, preview_base64, image_url, status, brand, format")
       .eq("id", flyerId)
       .maybeSingle();
 
@@ -89,14 +98,10 @@ export async function POST(req: NextRequest) {
     }
 
     if (!flyer.preview_base64) {
-      return errJson(
-        "Flyer não tem preview_base64. Rode /generate-image antes.",
-        null,
-        400
-      );
+      return errJson("Flyer não tem preview_base64. Rode /generate-image antes.", null, 400);
     }
 
-    // 3) converte base64 em buffer
+    // 3) base64 -> buffer (imagem base)
     let buffer: Buffer;
     try {
       buffer = base64ToBuffer(flyer.preview_base64);
@@ -104,18 +109,57 @@ export async function POST(req: NextRequest) {
       return errJson("Falha ao converter preview_base64 em buffer", e, 400);
     }
 
-    // 4) upload no storage
+    // 4) Detecta fundo no canto onde a logo vai ficar (top-left)
+    const position = "top-left" as const;
+    const detectedBg = await detectCornerBg({
+      baseBuffer: buffer,
+      corner: position,
+    }); // "light" | "dark"
+
+    // 5) Escolhe logo correta
+    const brandFolder: BrandFolder = brandToFolder(flyer.brand);
+    const format = (flyer.format || "instagram_feed") as any;
+
+    const logoPicked = pickLogo({
+      brand: brandFolder,
+      background: detectedBg,
+      format,
+      preferColor: true,
+    });
+
+    // 6) Aplica overlay
+    let finalBuffer = buffer;
+    let logoApplied = false;
+
+    if (logoPicked?.path) {
+      try {
+        finalBuffer = await overlayLogoOnBuffer({
+          baseBuffer: buffer,
+          logoPublicPath: logoPicked.path,
+          position: "top-left", // ✅ mais consistente para feed
+          marginPx: 56,         // ✅ safe area profissional
+          logoWidthPct: 0.18,   // ✅ tamanho mais elegante
+          addBackdrop: detectedBg === "dark", // opcional, ajuda em foto escura
+        });
+
+        logoApplied = true;
+      } catch (e: any) {
+        console.warn("Logo overlay falhou, subindo original:", e?.message);
+      }
+    }
+
+    // 7) Upload FINAL pro Storage
     const storagePath = `${prefix}/flyer-${flyerId}.png`;
 
     const { public_url } = await uploadPngToSupabaseStorage({
       supabaseAdmin,
       bucket,
       path: storagePath,
-      buffer,
+      buffer: finalBuffer,
       upsert: true,
     });
 
-    // 5) salva no db
+    // 8) Atualiza no DB
     const { data: updatedRows, error: updateErr } = await supabaseAdmin
       .from("flyers")
       .update({
@@ -135,6 +179,9 @@ export async function POST(req: NextRequest) {
       image_url: updated?.image_url ?? public_url,
       status: updated?.status ?? "IMAGE_READY",
       supabaseUpdated: true,
+      logoApplied,
+      logoPicked,
+      backgroundDetected: detectedBg,
       storage: { bucket, path: storagePath },
     });
   } catch (err: any) {
@@ -142,4 +189,3 @@ export async function POST(req: NextRequest) {
     return errJson("Erro inesperado no upload-image", err, 500);
   }
 }
-

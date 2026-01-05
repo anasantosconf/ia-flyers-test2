@@ -4,15 +4,20 @@ import path from "path";
 export async function overlayLogoOnBuffer({
   baseBuffer,
   logoPublicPath,
-  position = "top-right",
-  marginPct = 0.05,
-  logoWidthPct = 0.22,
+  position = "top-left",
+  // SAFE AREA em px (mais consistente que %)
+  marginPx = 56,
+  // largura da logo em % da imagem
+  logoWidthPct = 0.18,
+  // se true, coloca um retângulo semi-transparente atrás da logo (ótimo em foto)
+  addBackdrop = false,
 }: {
   baseBuffer: Buffer;
-  logoPublicPath: string; // ex: /logos/seguros/logo_seguros_branco_e_amarelo_lado.png
+  logoPublicPath: string;
   position?: "top-left" | "top-right";
-  marginPct?: number;
+  marginPx?: number;
   logoWidthPct?: number;
+  addBackdrop?: boolean;
 }): Promise<Buffer> {
   const logoFsPath = path.join(process.cwd(), "public", logoPublicPath);
 
@@ -20,11 +25,9 @@ export async function overlayLogoOnBuffer({
   const meta = await base.metadata();
 
   if (!meta.width || !meta.height) {
-    // fallback: retorna original se não conseguir metadados
     return baseBuffer;
   }
 
-  const margin = Math.round(meta.width * marginPct);
   const targetLogoWidth = Math.round(meta.width * logoWidthPct);
 
   const logoBuffer = await sharp(logoFsPath)
@@ -33,16 +36,41 @@ export async function overlayLogoOnBuffer({
     .toBuffer();
 
   const logoMeta = await sharp(logoBuffer).metadata();
+  const lw = logoMeta.width || targetLogoWidth;
+  const lh = logoMeta.height || Math.round(targetLogoWidth * 0.35);
 
-  const left =
-    position === "top-left"
-      ? margin
-      : meta.width - (logoMeta.width || targetLogoWidth) - margin;
+  const left = position === "top-left"
+    ? marginPx
+    : meta.width - lw - marginPx;
 
-  const top = margin;
+  const top = marginPx;
 
-  return base
-    .composite([{ input: logoBuffer, left, top }])
-    .png()
-    .toBuffer();
+  const composites: sharp.OverlayOptions[] = [];
+
+  if (addBackdrop) {
+    // fundo branco com transparência 70% e cantos arredondados (simulado)
+    const pad = 14;
+    const bw = lw + pad * 2;
+    const bh = lh + pad * 2;
+
+    const backdropSvg = `
+      <svg width="${bw}" height="${bh}">
+        <rect x="0" y="0" width="${bw}" height="${bh}" rx="16" ry="16" fill="white" fill-opacity="0.72" />
+      </svg>
+    `;
+
+    composites.push({
+      input: Buffer.from(backdropSvg),
+      left: left - pad,
+      top: top - pad,
+    });
+  }
+
+  composites.push({
+    input: logoBuffer,
+    left,
+    top,
+  });
+
+  return base.composite(composites).png().toBuffer();
 }
