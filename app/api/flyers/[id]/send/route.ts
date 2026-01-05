@@ -1,125 +1,166 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 
-const MAKE_WEBHOOK_URL =
-  process.env.MAKE_DRIVE_WHATSAPP_WEBHOOK ||
-  "https://hook.us2.make.com/esevum4fc3qyn7vn0b957f4mp3q2lya3";
+export const runtime = "nodejs";
+const isDev = process.env.NODE_ENV !== "production";
 
-export async function POST(
-  req: NextRequest,
-  context: { params: Promise<{ id: string }> }
-) {
+function errJson(message: string, err?: any, status = 500) {
+  return NextResponse.json(
+    {
+      success: false,
+      error: message,
+      ...(isDev && err
+        ? {
+            debug: {
+              message: err?.message,
+              details: err?.details,
+              hint: err?.hint,
+              code: err?.code,
+              status: err?.status,
+              stack: err?.stack,
+            },
+          }
+        : {}),
+    },
+    { status }
+  );
+}
+
+function getFlyerIdFromUrl(req: NextRequest): string | null {
+  const parts = new URL(req.url).pathname.split("/").filter(Boolean);
+  const flyersIndex = parts.indexOf("flyers");
+  if (flyersIndex === -1) return null;
+  return parts[flyersIndex + 1] ?? null;
+}
+
+function buildChatText(flyer: any) {
+  const title = flyer.title || `Flyer ${flyer.id}`;
+  const drive = flyer.drive_url || "";
+  const download = flyer.download_url || "";
+  const image = flyer.image_url || "";
+
+  return [
+    `✅ *Flyer pronto para envio!*`,
+    ``,
+    `*${title}*`,
+    ``,
+    drive ? `📁 Drive: ${drive}` : null,
+    download ? `⬇️ Download direto: ${download}` : null,
+    image ? `🖼️ Imagem (Storage): ${image}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * POST /api/flyers/:id/send
+ * body: { dry_run?: boolean }
+ */
+export async function POST(req: NextRequest) {
   try {
-    const { id } = await context.params;
-
     const supabaseAdmin = getSupabaseAdmin();
-    if (!supabaseAdmin) {
-      return NextResponse.json(
-        { error: "Supabase não configurado (env vars ausentes)" },
-        { status: 500 }
-      );
-    }
+    if (!supabaseAdmin) return errJson("Supabase admin NÃO configurado", null, 500);
 
-    // Buscar flyer + mensagem vinculada (pra pegar o telefone)
-    const { data: flyer, error: flyerError } = await supabaseAdmin
+    const flyerId = getFlyerIdFromUrl(req);
+    if (!flyerId) return errJson("Não foi possível extrair flyerId da URL", null, 400);
+
+    const body = await req.json().catch(() => ({}));
+    const dryRun = Boolean(body?.dry_run);
+
+    const webhookUrl = process.env.GOOGLE_CHAT_WEBHOOK_URL;
+    if (!webhookUrl) return errJson("Missing GOOGLE_CHAT_WEBHOOK_URL no env", null, 500);
+
+    // 1) Buscar flyer no Supabase
+    const { data: flyer, error: fetchErr } = await supabaseAdmin
       .from("flyers")
       .select("*")
-      .eq("id", id)
-      .single();
-
-    if (flyerError || !flyer) {
-      return NextResponse.json({ error: "Flyer não encontrado" }, { status: 404 });
-    }
-
-    if (!flyer.preview_base64) {
-      return NextResponse.json(
-        { error: "Esse flyer ainda não tem imagem gerada" },
-        { status: 400 }
-      );
-    }
-
-    // Buscar inbox vinculada (telefone de quem pediu)
-    const { data: inboxRow } = await supabaseAdmin
-      .from("inbox_messages")
-      .select("from_phone, from_id, from_name")
-      .eq("linked_flyer_id", id)
-      .order("created_at", { ascending: false })
-      .limit(1)
+      .eq("id", flyerId)
       .maybeSingle();
 
-    const phone = inboxRow?.from_phone || inboxRow?.from_id;
+    if (fetchErr) return errJson("Erro ao buscar flyer no Supabase", fetchErr, 500);
+    if (!flyer) return errJson("Flyer não encontrado", null, 404);
 
-    if (!phone) {
-      return NextResponse.json(
-        { error: "Não encontrei telefone para enviar (from_phone/from_id vazio)" },
-        { status: 400 }
+    if (!flyer.drive_url) {
+      return errJson(
+        "Flyer ainda não foi entregue no Drive. Rode /deliver antes.",
+        { flyer_id: flyerId, status: flyer.status, image_url: flyer.image_url },
+        400
       );
     }
 
-    // URL pública do PNG (via rota que serve o arquivo)
-    const origin = req.nextUrl.origin;
-    const imageUrl = `${origin}/api/flyers/${id}/image`;
+    const text = buildChatText(flyer);
 
-    const fileName = `flyer-${(flyer.brand || "Confi").replace(/\s+/g, "-")}-${id}.png`;
+    // 2) Dry run (não envia)
+    if (dryRun) {
+      return NextResponse.json({
+        success: true,
+        dry_run: true,
+        wouldSendToChat: true,
+        flyer_id: flyerId,
+        message: text,
+      });
+    }
 
-    // ✅ payload que o Make vai receber
-    const payload = {
-      flyer_id: id,
-      imageUrl,
-      fileName,
-      to_phone: phone,
-      customer_name: inboxRow?.from_name || null,
-      brand: flyer.brand || "Confi Seguros",
-      format: flyer.format || "instagram_feed",
-      messageText:
-        "✅ Pronto! Seu material já está no Drive. Segue o link:",
-    };
-
-    const makeResp = await fetch(MAKE_WEBHOOK_URL, {
+    // 3) Enviar para Google Chat via webhook
+    const chatRes = await fetch(webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      headers: { "Content-Type": "application/json; charset=UTF-8" },
+      body: JSON.stringify({ text }),
     });
 
-    const makeJson = await makeResp.json().catch(() => null);
-
-    if (!makeResp.ok) {
-      console.error("Make webhook error:", makeJson);
-      return NextResponse.json(
-        { error: "Erro ao chamar Make", details: makeJson },
-        { status: 500 }
-      );
+    const raw = await chatRes.text();
+    let chatJson: any = null;
+    try {
+      chatJson = JSON.parse(raw);
+    } catch {
+      // Google Chat às vezes pode retornar texto, mas normalmente é JSON
+      chatJson = { raw };
     }
 
-    // Esperado do Make:
-    // { ok: true, driveUrl: "...", whatsappSent: true, driveFileId: "...", driveFileName: "..." }
+    if (!chatRes.ok) {
+      return errJson("Google Chat webhook retornou erro", { status: chatRes.status, chatJson }, 502);
+    }
 
-    const driveUrl = makeJson?.driveUrl || null;
-    const whatsappSent = Boolean(makeJson?.whatsappSent);
+    // 4) Atualizar status no Supabase (se colunas existirem, ele salva; se não, ignora via try)
+    const updatePayload: any = {
+      status: "SENT_CHAT",
+    };
 
-    // Atualiza flyer
-    const newStatus = whatsappSent ? "ENVIADO" : "APROVADO";
+    // se você criou as colunas opcionais, elas serão preenchidas:
+    updatePayload.sent_chat_at = new Date().toISOString();
+    if (chatJson?.name) updatePayload.chat_message_id = chatJson.name;
 
-    const { error: updError } = await supabaseAdmin
+    const { error: updateErr } = await supabaseAdmin
       .from("flyers")
-      .update({
-        drive_url: driveUrl,
-        status: newStatus,
-      })
-      .eq("id", id);
+      .update(updatePayload)
+      .eq("id", flyerId);
 
-    if (updError) throw updError;
+    // Se não existir sent_chat_at/chat_message_id, o update pode falhar.
+    // Não vamos quebrar o envio por causa disso.
+    if (updateErr) {
+      return NextResponse.json({
+        success: true,
+        warning: "Mensagem enviada, mas não consegui atualizar status no Supabase",
+        flyer_id: flyerId,
+        drive_url: flyer.drive_url,
+        chat_response: chatJson,
+        supabaseError: {
+          message: updateErr.message,
+          details: updateErr.details,
+          hint: updateErr.hint,
+          code: updateErr.code,
+        },
+      });
+    }
 
     return NextResponse.json({
       success: true,
-      make: makeJson,
-      updated: { id, status: newStatus, driveUrl },
+      flyer_id: flyerId,
+      drive_url: flyer.drive_url,
+      chat_response: chatJson,
     });
-  } catch (err) {
-    console.error("POST /api/flyers/[id]/send error:", err);
-    return NextResponse.json(
-      { error: (err as Error).message || "Erro interno" },
-      { status: 500 }
-    );
+  } catch (err: any) {
+    console.error("POST /send error:", err);
+    return errJson("Erro inesperado no send", err, 500);
   }
 }
