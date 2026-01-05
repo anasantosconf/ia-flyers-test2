@@ -1,103 +1,120 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
-import path from "path";
+import { uploadPngToSupabaseStorage } from "@/lib/storage";
 import fs from "fs/promises";
+import path from "path";
 
-function stripBase64Prefix(base64: string) {
-  // remove "data:image/png;base64," se vier
-  return base64.replace(/^data:image\/\w+;base64,/, "");
+export const runtime = "nodejs";
+const isDev = process.env.NODE_ENV !== "production";
+
+function errJson(message: string, err?: any, status = 500) {
+  return NextResponse.json(
+    {
+      success: false,
+      error: message,
+      ...(isDev && err
+        ? {
+            debug: {
+              message: err?.message,
+              details: err?.details,
+              hint: err?.hint,
+              code: err?.code,
+              status: err?.status,
+              stack: err?.stack,
+            },
+          }
+        : {}),
+    },
+    { status }
+  );
 }
 
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+function getFlyerIdFromUrl(req: NextRequest): string | null {
+  const parts = new URL(req.url).pathname.split("/").filter(Boolean);
+  const flyersIndex = parts.indexOf("flyers");
+  if (flyersIndex === -1) return null;
+  return parts[flyersIndex + 1] ?? null;
+}
+
+/**
+ * POST /api/flyers/:id/upload-image
+ * body:
+ * {
+ *   relative_path?: "/generated/flyer-<id>.png"
+ * }
+ *
+ * Esse endpoint agora:
+ * - lê o arquivo do disco local (runtime)
+ * - faz upload pro Supabase Storage
+ * - salva image_url = URL pública do Storage
+ */
+export async function POST(req: NextRequest) {
   try {
-    const { id } = await params;
-
     const supabaseAdmin = getSupabaseAdmin();
-    if (!supabaseAdmin) {
-      return NextResponse.json(
-        { error: "Supabase não configurado" },
-        { status: 500 }
+    if (!supabaseAdmin) return errJson("Supabase admin NÃO configurado", null, 500);
+
+    const flyerId = getFlyerIdFromUrl(req);
+    if (!flyerId) return errJson("Não foi possível extrair flyerId da URL", null, 400);
+
+    const bucket = process.env.SUPABASE_STORAGE_BUCKET || "flyers";
+    const prefix = process.env.SUPABASE_STORAGE_PREFIX || "generated";
+
+    const body = await req.json().catch(() => ({}));
+    const relativePath = body?.relative_path || `/generated/flyer-${flyerId}.png`;
+
+    // Caminho físico do arquivo no projeto (App Router rodando em nodejs)
+    const filePath = path.join(process.cwd(), "public", relativePath.replace(/^\/+/, ""));
+
+    let fileBuffer: Buffer;
+    try {
+      fileBuffer = await fs.readFile(filePath);
+    } catch (readErr: any) {
+      return errJson(
+        "Não consegui ler o arquivo local. Verifique se ele existe em /public/generated.",
+        { filePath, message: readErr?.message },
+        404
       );
     }
 
-    const body = await req.json();
+    // Upload para Supabase Storage
+    const storagePath = `${prefix}/flyer-${flyerId}.png`;
 
-    /**
-     * Você pode mandar:
-     * {
-     *   "imageBase64": "...",
-     *   "format": "png"
-     * }
-     *
-     * OU:
-     * {
-     *   "imageUrl": "https://....png"
-     * }
-     */
+    const { public_url } = await uploadPngToSupabaseStorage({
+      supabaseAdmin,
+      bucket,
+      path: storagePath,
+      buffer: fileBuffer,
+      upsert: true,
+    });
 
-    let imageBuffer: Buffer | null = null;
-
-    // ✅ Caso 1: veio base64
-    if (body.imageBase64) {
-      const cleanBase64 = stripBase64Prefix(body.imageBase64);
-      imageBuffer = Buffer.from(cleanBase64, "base64");
-    }
-
-    // ✅ Caso 2: veio URL
-    if (!imageBuffer && body.imageUrl) {
-      const res = await fetch(body.imageUrl);
-      if (!res.ok) throw new Error("Não foi possível baixar imageUrl");
-      const arrayBuffer = await res.arrayBuffer();
-      imageBuffer = Buffer.from(arrayBuffer);
-    }
-
-    if (!imageBuffer) {
-      return NextResponse.json(
-        { error: "Envie imageBase64 ou imageUrl" },
-        { status: 400 }
-      );
-    }
-
-    // ✅ nome do arquivo
-    const ext = body.format || "png";
-    const fileName = `flyer-${id}.${ext}`;
-
-    // ✅ salvar em /public/generated/
-    const generatedDir = path.join(process.cwd(), "public", "generated");
-    await fs.mkdir(generatedDir, { recursive: true });
-
-    const filePath = path.join(generatedDir, fileName);
-    await fs.writeFile(filePath, imageBuffer);
-
-    // ✅ URL pública (Vercel/Next serve /public automaticamente)
-    const publicUrl = `${process.env.NEXT_PUBLIC_BASE_URL}/generated/${fileName}`;
-
-    // ✅ atualiza supabase (você pode trocar o nome do campo se quiser)
-    const { data, error } = await supabaseAdmin
+    // Atualiza Supabase DB
+    const { data: updatedRows, error: updateErr } = await supabaseAdmin
       .from("flyers")
       .update({
-        drive_url: publicUrl, // aqui usamos drive_url como "public image url"
-        status: "GERADO",
+        image_url: public_url,
+        status: "IMAGE_READY",
       })
-      .eq("id", id)
-      .select()
-      .single();
+      .eq("id", flyerId)
+      .select("id,image_url,status");
 
-    if (error) throw error;
+    if (updateErr) return errJson("Erro ao salvar image_url no Supabase", updateErr, 500);
+
+    const updated = updatedRows?.[0];
 
     return NextResponse.json({
       success: true,
-      flyer: data,
-      publicUrl,
+      id: flyerId,
+      image_url: updated?.image_url ?? public_url,
+      status: updated?.status ?? "IMAGE_READY",
+      supabaseUpdated: true,
+      storage: {
+        bucket,
+        path: storagePath,
+      },
     });
-  } catch (err) {
-    console.error("upload-image error:", err);
-    return NextResponse.json(
-      { error: (err as Error).message || "Erro interno" },
-      { status: 500 }
-    );
+  } catch (err: any) {
+    console.error("POST /upload-image error:", err);
+    return errJson("Erro inesperado no upload-image", err, 500);
   }
 }
+

@@ -1,154 +1,184 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
+import crypto from "crypto";
 
-type DeliverBody = {
-  channel?: "whatsapp" | "google_chat";
-  to?: string; // telefone ou id
-  name?: string;
-  message?: string;
-  fileName?: string;
-  makeWebhookUrl?: string; // opcional pra testar
-};
+export const runtime = "nodejs";
+const isDev = process.env.NODE_ENV !== "production";
 
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> } // ✅ Next 16
-) {
+function errJson(message: string, err?: any, status = 500) {
+  return NextResponse.json(
+    {
+      success: false,
+      error: message,
+      ...(isDev && err
+        ? {
+            debug: {
+              message: err?.message,
+              details: err?.details,
+              hint: err?.hint,
+              code: err?.code,
+              status: err?.status,
+              stack: err?.stack,
+            },
+          }
+        : {}),
+    },
+    { status }
+  );
+}
+
+/**
+ * Extrai o flyerId diretamente do URL:
+ * /api/flyers/:id/deliver
+ */
+function getFlyerIdFromUrl(req: NextRequest): string | null {
+  const parts = new URL(req.url).pathname.split("/").filter(Boolean);
+  // ["api","flyers",":id","deliver"]
+  const flyersIndex = parts.indexOf("flyers");
+  if (flyersIndex === -1) return null;
+  return parts[flyersIndex + 1] ?? null;
+}
+
+/**
+ * POST /api/flyers/:id/deliver
+ * body: { dry_run?: boolean, force?: boolean }
+ *
+ * Idempotente:
+ * - se drive_url já existe e force = false -> retorna sem chamar Make
+ */
+export async function POST(req: NextRequest) {
   try {
-    const { id: flyerId } = await params;
+    const supabaseAdmin = getSupabaseAdmin();
+    if (!supabaseAdmin) return errJson("Supabase admin NÃO configurado", null, 500);
 
-    if (!flyerId) {
-      return NextResponse.json({ error: "flyerId obrigatório" }, { status: 400 });
-    }
+    const flyerId = getFlyerIdFromUrl(req);
+    if (!flyerId) return errJson("Não foi possível extrair flyerId da URL", null, 400);
 
-    const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      return NextResponse.json(
-        { error: "Supabase não configurado (env vars ausentes)" },
-        { status: 500 }
-      );
-    }
+    const body = await req.json().catch(() => ({}));
+    const dryRun = Boolean(body?.dry_run);
+    const force = Boolean(body?.force);
 
-    const body = (await req.json()) as DeliverBody;
-
-    const makeWebhookUrl =
-      body.makeWebhookUrl || process.env.MAKE_DRIVE_WHATSAPP_WEBHOOK_URL;
-
-    if (!makeWebhookUrl) {
-      return NextResponse.json(
-        { error: "MAKE_DRIVE_WHATSAPP_WEBHOOK_URL não configurado" },
-        { status: 500 }
-      );
-    }
+    const makeUrl = process.env.MAKE_WEBHOOK_URL;
+    if (!makeUrl) return errJson("Missing MAKE_WEBHOOK_URL no env", null, 500);
 
     // 1) Buscar flyer
-    const { data: flyer, error: flyerError } = await supabase
+    const { data: flyer, error: fetchErr } = await supabaseAdmin
       .from("flyers")
       .select("*")
       .eq("id", flyerId)
-      .single();
+      .maybeSingle();
 
-    if (flyerError) throw flyerError;
-    if (!flyer) {
-      return NextResponse.json({ error: "Flyer não encontrado" }, { status: 404 });
+    if (fetchErr) return errJson("Erro ao buscar flyer no Supabase", fetchErr, 500);
+    if (!flyer) return errJson("Flyer não encontrado", null, 404);
+
+    if (!flyer.image_url) {
+      return errJson("Flyer sem image_url. Rode /upload-image antes.", null, 400);
     }
 
-    if (!flyer.preview_base64) {
-      return NextResponse.json(
-        { error: "Flyer não possui preview_base64 para salvar/enviar" },
-        { status: 400 }
-      );
+    // 2) Se já entregue, retorna e NÃO chama Make
+    if (flyer.drive_url && !force) {
+      return NextResponse.json({
+        success: true,
+        alreadyDelivered: true,
+        flyer_id: flyerId,
+        drive_url: flyer.drive_url,
+        download_url: flyer.download_url ?? null,
+        image_url: flyer.image_url,
+        status: flyer.status ?? null,
+      });
     }
 
-    // Nome padrão do arquivo
-    const fileName =
-      body.fileName ||
-      `flyer-${(flyer.brand || "confi")
-        .toString()
-        .toLowerCase()
-        .replace(/\s+/g, "-")}-${flyer.id}.png`;
+    // 3) Dry run (não chama Make)
+    if (dryRun) {
+      return NextResponse.json({
+        success: true,
+        dry_run: true,
+        wouldCallMake: true,
+        flyer_id: flyerId,
+        image_url: flyer.image_url,
+        make_webhook: makeUrl,
+      });
+    }
 
-    // Mensagem padrão
-    const message =
-      body.message ||
-      `Olá ${body.name || ""}! ✅ Seu flyer já está pronto.\n\nVou te enviar o link do Drive em seguida.`;
+    // 4) Chamar Make
+    const requestId = crypto.randomUUID();
 
-    // 2) Chamar Make para salvar no Drive + enviar WhatsApp
     const payload = {
-      flyerId: flyer.id,
-      brand: flyer.brand,
-      format: flyer.format,
-      prompt: flyer.prompt,
-
-      imageBase64: flyer.preview_base64,
-      fileName,
-
-      sendTo: {
-        channel: body.channel || "whatsapp",
-        to: body.to,
-        name: body.name,
+      request_id: requestId,
+      flyer_id: flyerId,
+      title: flyer.title ?? `Flyer ${flyerId}`,
+      image_url: flyer.image_url,
+      drive: {
+        filename: `flyer-${flyerId}.png`,
       },
-
-      message,
     };
 
-    const makeRes = await fetch(makeWebhookUrl, {
+    const makeRes = await fetch(makeUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
-    const makeText = await makeRes.text();
+    const raw = await makeRes.text();
+
     let makeJson: any = null;
-
     try {
-      makeJson = JSON.parse(makeText);
+      makeJson = JSON.parse(raw);
     } catch {
-      // resposta não-JSON
-    }
-
-    if (!makeRes.ok) {
-      console.error("Make error:", makeRes.status, makeText);
-      return NextResponse.json(
-        {
-          error: "Erro no Make (Drive/WhatsApp)",
-          status: makeRes.status,
-          details: makeJson || makeText,
-        },
-        { status: 500 }
+      return errJson(
+        "Make não retornou JSON (adicione Webhooks → Response no final do cenário).",
+        { raw: raw.slice(0, 800), status: makeRes.status },
+        502
       );
     }
 
-    const driveUrl = makeJson?.drive_url || makeJson?.driveUrl || null;
-    const fileId = makeJson?.file_id || makeJson?.fileId || null;
-    const sent = makeJson?.sent ?? true;
+    if (!makeRes.ok) return errJson("Make retornou erro", makeJson, 502);
 
-    // 3) Atualizar flyer no Supabase
-    const updateData: any = {
-      status: "ENVIADO",
-    };
+    const driveUrl = makeJson?.drive_url || makeJson?.share_link;
+    const downloadUrl = makeJson?.download_url || makeJson?.web_content_link;
 
-    if (driveUrl) updateData.drive_url = driveUrl;
+    if (!driveUrl) return errJson("Make não retornou drive_url", makeJson, 502);
 
-    const { data: updatedFlyer, error: updateErr } = await supabase
+    // 5) Salvar no Supabase
+    const { data: updatedRows, error: updateErr } = await supabaseAdmin
       .from("flyers")
-      .update(updateData)
+      .update({
+        drive_url: driveUrl,
+        download_url: downloadUrl ?? null,
+        status: "DELIVERED",
+      })
       .eq("id", flyerId)
-      .select()
-      .single();
+      .select("*");
 
-    if (updateErr) throw updateErr;
+    if (updateErr) {
+      // Drive foi ok mas falhou salvar Supabase
+      return NextResponse.json({
+        success: true,
+        warning: "Drive uploaded mas Supabase update falhou",
+        flyer_id: flyerId,
+        drive_url: driveUrl,
+        download_url: downloadUrl ?? null,
+        make_response: makeJson,
+        supabaseError: {
+          message: updateErr.message,
+          details: updateErr.details,
+          hint: updateErr.hint,
+          code: updateErr.code,
+        },
+      });
+    }
+
+    const updated = updatedRows?.[0];
 
     return NextResponse.json({
-      ok: true,
-      flyer: updatedFlyer,
-      make: { driveUrl, fileId, sent },
+      success: true,
+      flyer_id: flyerId,
+      drive_url: driveUrl,
+      download_url: downloadUrl ?? null,
+      flyer: updated ?? null,
     });
-  } catch (err) {
-    console.error("deliver flyer error:", err);
-    return NextResponse.json(
-      { error: "Erro ao salvar/enviar flyer" },
-      { status: 500 }
-    );
+  } catch (err: any) {
+    console.error("POST /deliver error:", err);
+    return errJson("Erro inesperado no deliver", err, 500);
   }
 }
