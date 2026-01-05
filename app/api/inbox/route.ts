@@ -4,8 +4,9 @@ import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 export async function GET() {
   try {
     const supabaseAdmin = getSupabaseAdmin();
+
     if (!supabaseAdmin) {
-      return NextResponse.json([], { status: 200 });
+      return NextResponse.json([], { status: 200 }); // não quebra o front
     }
 
     const { data, error } = await supabaseAdmin
@@ -19,6 +20,9 @@ export async function GET() {
     return NextResponse.json(data);
   } catch (err) {
     console.error("GET /api/inbox error:", err);
-    return NextResponse.json({ error: "Erro ao buscar inbox" }, { status: 500 });
+    return NextResponse.json(
+      { error: "Erro ao buscar inbox" },
+      { status: 500 }
+    );
   }
 }
