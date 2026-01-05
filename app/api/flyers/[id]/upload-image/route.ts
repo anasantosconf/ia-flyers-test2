@@ -57,7 +57,7 @@ function brandToFolder(brand: string | null): BrandFolder {
  * - Usa preview_base64 (gerado no /generate-image)
  * - Detecta fundo no canto (top-left)
  * - Escolhe logo correta (branca/preta/colorida)
- * - Cola logo (Sharp) dentro do safe area
+ * - Cola logo (Sharp) com safe area
  * - Sobe pro Supabase Storage
  * - Salva image_url e status=IMAGE_READY
  */
@@ -72,7 +72,7 @@ export async function POST(req: NextRequest) {
     const bucket = process.env.SUPABASE_STORAGE_BUCKET || "flyers";
     const prefix = process.env.SUPABASE_STORAGE_PREFIX || "generated";
 
-    // 1) busca flyer no Supabase (inclui brand/format pra escolher logo)
+    // 1) Busca flyer
     const { data: flyer, error: fetchErr } = await supabaseAdmin
       .from("flyers")
       .select("id, preview_base64, image_url, status, brand, format")
@@ -82,7 +82,7 @@ export async function POST(req: NextRequest) {
     if (fetchErr) return errJson("Erro ao buscar flyer no Supabase", fetchErr, 500);
     if (!flyer) return errJson("Flyer não encontrado", null, 404);
 
-    // 2) se já tem image_url e não quiser forçar
+    // 2) body: force
     const body = await req.json().catch(() => ({}));
     const force = Boolean(body?.force);
 
@@ -101,7 +101,7 @@ export async function POST(req: NextRequest) {
       return errJson("Flyer não tem preview_base64. Rode /generate-image antes.", null, 400);
     }
 
-    // 3) base64 -> buffer (imagem base)
+    // 3) base64 -> buffer
     let buffer: Buffer;
     try {
       buffer = base64ToBuffer(flyer.preview_base64);
@@ -109,14 +109,14 @@ export async function POST(req: NextRequest) {
       return errJson("Falha ao converter preview_base64 em buffer", e, 400);
     }
 
-    // 4) Detecta fundo no canto onde a logo vai ficar (top-left)
+    // 4) Detecta o fundo do canto onde a logo vai (top-left)
     const position = "top-left" as const;
     const detectedBg = await detectCornerBg({
       baseBuffer: buffer,
       corner: position,
     }); // "light" | "dark"
 
-    // 5) Escolhe logo correta
+    // 5) Escolhe logo
     const brandFolder: BrandFolder = brandToFolder(flyer.brand);
     const format = (flyer.format || "instagram_feed") as any;
 
@@ -127,29 +127,36 @@ export async function POST(req: NextRequest) {
       preferColor: true,
     });
 
-    // 6) Aplica overlay
+    // 6) Overlay (robusto com debug)
     let finalBuffer = buffer;
     let logoApplied = false;
+    let overlayDebug: any = null;
 
     if (logoPicked?.path) {
       try {
-        finalBuffer = await overlayLogoOnBuffer({
-          baseBuffer: buffer,
-          logoPublicPath: logoPicked.path,
-          position: "top-left", // ✅ mais consistente para feed
-          marginPx: 56,         // ✅ safe area profissional
-          logoWidthPct: 0.18,   // ✅ tamanho mais elegante
-          addBackdrop: detectedBg === "dark", // opcional, ajuda em foto escura
-        });
+        const res = await overlayLogoOnBuffer({
+  baseBuffer: buffer,
+  logoPublicPath: logoPicked.path,
+  position: "top-left",
+  marginPx: 56,
+  logoWidthPct: 0.18,
+  addBackdrop: false,
+  debugDraw: true, // ✅ LIGADO
+});
 
+
+        finalBuffer = res.buffer;
+        overlayDebug = res.debug;
         logoApplied = true;
       } catch (e: any) {
         console.warn("Logo overlay falhou, subindo original:", e?.message);
       }
     }
 
-    // 7) Upload FINAL pro Storage
-    const storagePath = `${prefix}/flyer-${flyerId}.png`;
+    // 7) Upload FINAL
+    const version = Date.now();
+    const storagePath = `${prefix}/flyer-${flyerId}-${version}.png`;
+
 
     const { public_url } = await uploadPngToSupabaseStorage({
       supabaseAdmin,
@@ -159,7 +166,7 @@ export async function POST(req: NextRequest) {
       upsert: true,
     });
 
-    // 8) Atualiza no DB
+    // 8) Atualiza DB
     const { data: updatedRows, error: updateErr } = await supabaseAdmin
       .from("flyers")
       .update({
@@ -182,6 +189,7 @@ export async function POST(req: NextRequest) {
       logoApplied,
       logoPicked,
       backgroundDetected: detectedBg,
+      overlayDebug, // ✅ te diz se trim foi usado, tamanho real, posição etc.
       storage: { bucket, path: storagePath },
     });
   } catch (err: any) {
