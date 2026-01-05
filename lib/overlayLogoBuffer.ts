@@ -15,37 +15,72 @@ export async function overlayLogoOnBuffer({
   marginPx?: number;
   logoWidthPct?: number;
   addBackdrop?: boolean;
-}): Promise<Buffer> {
+}): Promise<{
+  buffer: Buffer;
+  debug: {
+    logoWidth: number;
+    logoHeight: number;
+    usedTrim: boolean;
+    position: string;
+    left: number;
+    top: number;
+  };
+}> {
   const logoFsPath = path.join(process.cwd(), "public", logoPublicPath);
 
-  // ✅ Base (normaliza orientação também)
+  // ✅ Base normalizada
   const base = sharp(baseBuffer).rotate();
   const meta = await base.metadata();
 
-  if (!meta.width || !meta.height) return baseBuffer;
+  if (!meta.width || !meta.height) {
+    return {
+      buffer: baseBuffer,
+      debug: {
+        logoWidth: 0,
+        logoHeight: 0,
+        usedTrim: false,
+        position,
+        left: 0,
+        top: 0,
+      },
+    };
+  }
 
   const targetLogoWidth = Math.round(meta.width * logoWidthPct);
 
-  /**
-   * ✅ LOGO:
-   * - rotate() pra normalizar
-   * - trim() pra remover padding transparente
-   * - resize() depois do trim
-   */
-  const trimmedLogo = sharp(logoFsPath)
+  // 1) primeiro resize SEM trim (seguro)
+  const resizedLogoBuffer = await sharp(logoFsPath)
     .rotate()
-    .trim();
-
-  const logoBuffer = await trimmedLogo
     .resize({ width: targetLogoWidth, withoutEnlargement: true })
     .png()
     .toBuffer();
 
-  const logoMeta = await sharp(logoBuffer).metadata();
+  // 2) tenta trim com segurança
+  let logoBuffer = resizedLogoBuffer;
+  let usedTrim = false;
 
+  try {
+    const trimmed = await sharp(resizedLogoBuffer)
+      .trim({ threshold: 5 }) // threshold baixo pra não “comer” a logo
+      .png()
+      .toBuffer();
+
+    const tMeta = await sharp(trimmed).metadata();
+
+    // ✅ se o trim der resultado MUITO pequeno, ignora
+    if ((tMeta.width || 0) >= 40 && (tMeta.height || 0) >= 20) {
+      logoBuffer = trimmed;
+      usedTrim = true;
+    }
+  } catch {
+    // ignora trim se falhar
+  }
+
+  const logoMeta = await sharp(logoBuffer).metadata();
   const lw = logoMeta.width || targetLogoWidth;
   const lh = logoMeta.height || Math.round(targetLogoWidth * 0.35);
 
+  // ✅ posição
   const left =
     position === "top-left"
       ? marginPx
@@ -75,7 +110,17 @@ export async function overlayLogoOnBuffer({
 
   composites.push({ input: logoBuffer, left, top });
 
-  // ✅ Render final (mantém em PNG)
-  return base.composite(composites).png().toBuffer();
-}
+  const out = await base.composite(composites).png().toBuffer();
 
+  return {
+    buffer: out,
+    debug: {
+      logoWidth: lw,
+      logoHeight: lh,
+      usedTrim,
+      position,
+      left,
+      top,
+    },
+  };
+}
