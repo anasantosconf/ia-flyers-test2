@@ -5,11 +5,8 @@ export async function overlayLogoOnBuffer({
   baseBuffer,
   logoPublicPath,
   position = "top-left",
-  // SAFE AREA em px (mais consistente que %)
   marginPx = 56,
-  // largura da logo em % da imagem
   logoWidthPct = 0.18,
-  // se true, coloca um retângulo semi-transparente atrás da logo (ótimo em foto)
   addBackdrop = false,
 }: {
   baseBuffer: Buffer;
@@ -21,34 +18,44 @@ export async function overlayLogoOnBuffer({
 }): Promise<Buffer> {
   const logoFsPath = path.join(process.cwd(), "public", logoPublicPath);
 
-  const base = sharp(baseBuffer);
+  // ✅ Base (normaliza orientação também)
+  const base = sharp(baseBuffer).rotate();
   const meta = await base.metadata();
 
-  if (!meta.width || !meta.height) {
-    return baseBuffer;
-  }
+  if (!meta.width || !meta.height) return baseBuffer;
 
   const targetLogoWidth = Math.round(meta.width * logoWidthPct);
 
-  const logoBuffer = await sharp(logoFsPath)
+  /**
+   * ✅ LOGO:
+   * - rotate() pra normalizar
+   * - trim() pra remover padding transparente
+   * - resize() depois do trim
+   */
+  const trimmedLogo = sharp(logoFsPath)
+    .rotate()
+    .trim();
+
+  const logoBuffer = await trimmedLogo
     .resize({ width: targetLogoWidth, withoutEnlargement: true })
     .png()
     .toBuffer();
 
   const logoMeta = await sharp(logoBuffer).metadata();
+
   const lw = logoMeta.width || targetLogoWidth;
   const lh = logoMeta.height || Math.round(targetLogoWidth * 0.35);
 
-  const left = position === "top-left"
-    ? marginPx
-    : meta.width - lw - marginPx;
+  const left =
+    position === "top-left"
+      ? marginPx
+      : meta.width - lw - marginPx;
 
   const top = marginPx;
 
   const composites: sharp.OverlayOptions[] = [];
 
   if (addBackdrop) {
-    // fundo branco com transparência 70% e cantos arredondados (simulado)
     const pad = 14;
     const bw = lw + pad * 2;
     const bh = lh + pad * 2;
@@ -66,11 +73,9 @@ export async function overlayLogoOnBuffer({
     });
   }
 
-  composites.push({
-    input: logoBuffer,
-    left,
-    top,
-  });
+  composites.push({ input: logoBuffer, left, top });
 
+  // ✅ Render final (mantém em PNG)
   return base.composite(composites).png().toBuffer();
 }
+
