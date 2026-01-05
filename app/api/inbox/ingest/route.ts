@@ -4,66 +4,81 @@ import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 export async function POST(req: NextRequest) {
   try {
     const supabaseAdmin = getSupabaseAdmin();
+
+    // ✅ Se env vars não existem no Vercel, a gente vê já
     if (!supabaseAdmin) {
       return NextResponse.json(
-        { ok: false, error: "Supabase não configurado (env vars ausentes)" },
+        {
+          ok: false,
+          error: "Supabase não configurado (env vars ausentes)",
+          hint: "Verifique SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no Vercel (Production).",
+        },
         { status: 500 }
       );
     }
 
     const body = await req.json();
 
-    // ✅ normalização: aceita várias formas
     const channel = body.channel || "whatsapp";
     const from_name = body.from_name || null;
-
-    // telefone pode vir em from_phone OU from_id (se você mandou telefone no from_id)
-    const from_phone = body.from_phone || body.from_id || null;
-
-    // id externo real (se existir)
     const from_id = body.from_id || null;
-
-    const text = body.text;
     const external_id = body.external_id || null;
+    const text = body.text;
 
-    // ✅ validação mínima
-    if (!text) {
+    // opcional: payload bruto para auditoria
+    const raw = body.raw || body || null;
+
+    if (!text || typeof text !== "string") {
       return NextResponse.json(
         { ok: false, error: "Campo 'text' é obrigatório" },
         { status: 400 }
       );
     }
 
-    const payloadToInsert = {
+    // ✅ Sua tabela tem os 2: from_id e from_phone
+    // Para WhatsApp, normalmente o from_id é o telefone.
+    const from_phone =
+      channel === "whatsapp" ? (from_id || body.from_phone || null) : (body.from_phone || null);
+
+    const payload = {
       channel,
       from_name,
-      from_phone,
       from_id,
+      from_phone,
       external_id,
       text,
-      raw: body, // guarda tudo que veio
+      raw,
       processed: false,
     };
 
     const { data, error } = await supabaseAdmin
       .from("inbox_messages")
-      .insert([payloadToInsert])
+      .insert([payload])
       .select()
       .single();
 
     if (error) {
-      console.error("inbox ingest supabase error:", error);
+      console.error("Supabase insert error:", error);
       return NextResponse.json(
-        { ok: false, error: error.message, details: error },
+        {
+          ok: false,
+          error: error.message,
+          details: error.details || null,
+          hint: error.hint || null,
+          code: error.code || null,
+        },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ ok: true, msg: "POST ok", inserted: data });
+    return NextResponse.json({ ok: true, msg: "POST ok", row: data });
   } catch (err) {
     console.error("inbox ingest error:", err);
     return NextResponse.json(
-      { ok: false, error: (err as Error).message || "Erro interno" },
+      {
+        ok: false,
+        error: (err as any)?.message || "Erro interno no servidor",
+      },
       { status: 500 }
     );
   }
