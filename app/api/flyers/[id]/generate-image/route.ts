@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 
+// 1x1 PNG transparente (base64)
+const MOCK_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBApX0WZkAAAAASUVORK5CYII=";
+
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -16,6 +20,9 @@ export async function POST(
       );
     }
 
+    const url = new URL(req.url);
+    const mock = url.searchParams.get("mock") === "true";
+
     // 1) Buscar flyer
     const { data: flyer, error: flyerError } = await supabaseAdmin
       .from("flyers")
@@ -30,8 +37,30 @@ export async function POST(
       );
     }
 
-    // 2) Chamar generateFlyerImage
-    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://ia-flyers-test2.vercel.app";
+    // 2) Se mock, não chama OpenAI
+    if (mock) {
+      const { data: updatedFlyer, error: updateError } = await supabaseAdmin
+        .from("flyers")
+        .update({
+          preview_base64: MOCK_BASE64,
+          status: "GERADO",
+        })
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
+
+      return NextResponse.json({
+        success: true,
+        mock: true,
+        flyer: updatedFlyer,
+      });
+    }
+
+    // 3) Modo real (OpenAI)
+    const baseUrl =
+      process.env.NEXT_PUBLIC_BASE_URL || "https://ia-flyers-test2.vercel.app";
 
     const resp = await fetch(`${baseUrl}/api/generateFlyerImage`, {
       method: "POST",
@@ -54,7 +83,6 @@ export async function POST(
 
     const previewBase64 = result.previewBase64;
 
-    // 3) Atualizar flyer no Supabase
     const { data: updatedFlyer, error: updateError } = await supabaseAdmin
       .from("flyers")
       .update({
@@ -69,10 +97,11 @@ export async function POST(
 
     return NextResponse.json({
       success: true,
+      mock: false,
       flyer: updatedFlyer,
     });
   } catch (err) {
-    console.error("generate flyer image route error:", err);
+    console.error("generate-image error:", err);
     return NextResponse.json(
       { error: "Erro interno ao gerar imagem do flyer" },
       { status: 500 }
